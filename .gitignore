@@ -1,0 +1,12 @@
+.gitignore
+Objects
+Output
+*~
+*.i
+*.s
+*.o
+*.res
+*.exe
+Objects
+build*_*_*.log
+obj*_*_*
