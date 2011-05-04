@@ -26,6 +26,52 @@
 #include <initguid.h>
 #include <ntddstor.h>
 
+/** Macros */
+#define WbtMessage(x_) DbgPrint(x_); WbtPrint(x_, sizeof x_)
+#define M_WBT_READ_TIME (-100000000LL)
+#define M_WBT_DELAY_TIME (-10000000LL)
+
+/* Handy for arrays. */
+#define COUNTOF(array_) \
+  (sizeof (array_) / sizeof *(array_))
+#define FOR_EACH_ELEMENT(index_, array_) \
+  for ((index_) = 0; (index_) < COUNTOF(array_); (index_)++)
+
+/** Constants */
+enum {
+    CvWbtDummySig = 0xEFBEADDE,
+    CvWbtMaxAttempts = 10,
+    CvWbtMsgBufSize = 100,
+    CvWbtZero = 0
+  };
+
+/** Object types */
+typedef union {
+    LONGLONG longlong;
+    LARGE_INTEGER large_int;
+  } U_WBT_LARGE_INT;
+typedef struct {
+    const GUID * from_guid;
+    PCHAR intf_name;
+    PVOID registration;
+    GUID guid;
+  } S_WBT_INTF;
+typedef CHAR A_WBT_MSG[CvWbtMsgBufSize];
+
+/** Function declarations */
+extern int snprintf(char *, size_t, const char *, ...);
+
+/** Object definitions */
+static S_WBT_INTF WbtIntfs[] = {
+    {&GUID_DEVINTERFACE_DISK, "Disk", 0},
+    {&GUID_DEVINTERFACE_PARTITION, "Partition", 0},
+    {&GUID_DEVINTERFACE_STORAGEPORT, "Storage Port", 0},
+    {&GUID_DEVINTERFACE_VOLUME, "Volume", 0},
+  };
+
+/** Function definitions */
+
+/* Diplay a debugging message */
 static VOID WbtPrint(PCHAR message, USHORT size) {
     static WCHAR err_msg[] = L"WaitBt: WbtPrint() failed!\n";
     static UNICODE_STRING uerr_msg = {
@@ -51,189 +97,186 @@ static VOID WbtPrint(PCHAR message, USHORT size) {
     return;
   }
 
-#define WbtMessage(x_) DbgPrint(x_); WbtPrint(x_, sizeof x_)
+/* Display the failure status to the user */
+static VOID WbtFailure(void) {
+    static U_WBT_LARGE_INT read_time = {M_WBT_READ_TIME};
 
-static ULONG WbtDiskSignature(HANDLE file) {
-    LARGE_INTEGER offset;
-    NTSTATUS status;
-    IO_STATUS_BLOCK io_status;
-    UCHAR mbr[512];
-    ULONG sig = 0;
-
-    offset.QuadPart = 0;
-    status = ZwReadFile(
-        file,
-        NULL,
-        NULL,
-        NULL,
-        &io_status,
-        mbr,
-        sizeof mbr,
-        &offset,
-        NULL
-      );
-    if (!NT_SUCCESS(status)) {
-        WbtMessage("WaitBt: Couldn't read disk MBR.\n");
-        goto out;
-      }
-
-    RtlCopyMemory(&sig, mbr + 440, sizeof sig);
-
-    out:
-    return sig;
+    WbtMessage("WaitBt: Maximum failed attempts reached!\n");
+    /* Give the user some time to read this status. */
+    KeDelayExecutionThread(KernelMode, FALSE, &read_time.large_int);
+    return;
   }
 
-static BOOLEAN WbtCheckBootDisk(ULONG sig, IN PWCHAR dev_name) {
-    UNICODE_STRING path;
-    OBJECT_ATTRIBUTES obj_attrs;
+/* De-register for notification of certain device interface arrivals */
+static VOID WbtDeregisterIntfNotifications(void) {
+    SIZE_T i;
     NTSTATUS status;
-    HANDLE file = 0;
-    IO_STATUS_BLOCK io_status;
-    BOOLEAN match = FALSE;
 
-    RtlInitUnicodeString(&path, dev_name);
-    WbtMessage("WaitBt: Checking disk: ");
-    ZwDisplayString(&path);
-    WbtMessage(" ...\n");
-
-    InitializeObjectAttributes(
-        &obj_attrs,
-        &path,
-        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
-        NULL,
-        NULL
-      );
-    /* Try this disk. */
-    status = ZwCreateFile(
-        &file,
-        GENERIC_READ,
-        &obj_attrs,
-        &io_status,
-        NULL,
-        FILE_ATTRIBUTE_NORMAL,
-        FILE_SHARE_READ | FILE_SHARE_DELETE | FILE_SHARE_WRITE,
-        FILE_OPEN,
-        FILE_NON_DIRECTORY_FILE |
-          FILE_RANDOM_ACCESS |
-          FILE_SYNCHRONOUS_IO_NONALERT,
-        NULL,
-        0
-      );
-    if (!NT_SUCCESS(status)) {
-        WbtMessage("WaitBt: Couldn't open disk.\n");
-        return match;
-      }
-
-    if (WbtDiskSignature(file) == sig)
-      /* Found! */
-      match = TRUE;
-
-    ZwClose(file);
-
-    return match;
-  }
-
-static VOID WbtWaitForBootDisk() {
-    static BOOTDISK_INFORMATION info = {0, 0, 0xEFBEADDE, 0xEFBEADDE};
-    static CHAR sig_msg[100] = {0};
-    NTSTATUS status;
-    KEVENT dummy_event;
-    LARGE_INTEGER timeout;
-    INT sig_msg_size, attempts = 10;
-    GUID disk_guid = GUID_DEVINTERFACE_DISK;
-    PWSTR sym_links;
-    PWCHAR pos;
-
-    KeInitializeEvent(&dummy_event, SynchronizationEvent, FALSE);
-    /* 1 second. */
-    timeout.QuadPart = -10000000LL;
-
-    while (attempts--) {
-        /* Fetch the boot disk information. */
-        status = IoGetBootDiskInformation(&info, sizeof info);
+    FOR_EACH_ELEMENT(i, WbtIntfs) {
+        status = IoUnregisterPlugPlayNotification(WbtIntfs[i].registration);
         if (!NT_SUCCESS(status)) {
-            WbtMessage("WaitBt: Couldn't read boot disk MBR signature!\n");
-            goto wait;
-          }
-        if (
-            info.BootDeviceSignature == 0xEFBEADDE ||
-            info.SystemDeviceSignature == 0xEFBEADDE
-          ) {
-            WbtMessage("WaitBt: Disk signature(s) not provided!\n");
-            goto wait;
-          }
+            INT msg_size;
+            A_WBT_MSG msg;
 
-        sig_msg_size = sprintf(
-            sig_msg,
-            "WaitBt: Boot sig: 0x%08X Sys sig: 0x%08X\n",
-            info.BootDeviceSignature,
-            info.SystemDeviceSignature
-          );
-        if (sig_msg_size < 1) {
-            WbtMessage("WaitBt: Cannot display disk signatures!\n");
-            goto wait;
-          }
-        DbgPrint(sig_msg);
-        WbtPrint(sig_msg, (USHORT)sig_msg_size);
-
-        /* Fetch the list of disks. */
-        status = IoGetDeviceInterfaces(&disk_guid, NULL, 0, &sym_links);
-        if (!NT_SUCCESS(status)) {
-            WbtMessage("WaitBt: Couldn't enumerate disks!\n");
-            goto wait;
-          }
-
-        pos = sym_links;
-        /* Process each disk, looking for the boot disk. */
-        while (*pos != UNICODE_NULL) {
-            if (WbtCheckBootDisk(info.BootDeviceSignature, pos)) {
-                /* Found it. */
-                WbtMessage("WaitBt: Found!\n");
-                ExFreePool(sym_links);
-                return;
+            msg_size = sprintf(
+                msg,
+                "WaitBt: Still getting %s notifications!\n",
+                WbtIntfs[i].intf_name
+              );
+            if (msg_size < 1) {
+                WbtMessage("WaitBt: Message problem!\n");
+              } else {
+                DbgPrint(msg);
+                WbtPrint(msg, (USHORT)msg_size);
               }
-            /* Step to the next disk. */
-            while (*pos != UNICODE_NULL)
-              pos++;
-            pos++;
           }
-
-        ExFreePool(sym_links);
-        /* Wait for 1 second, then try again. */
-        wait:
-        WbtMessage("WaitBt: Waiting 1 second...\n");
-        KeWaitForSingleObject(
-            &dummy_event,
-            Executive,
-            KernelMode,
-            FALSE,
-            &timeout
-          );
-        KeResetEvent(&dummy_event);
-      }
-    WbtMessage("WaitBt: Failed 10 times!\n");
-    /* Give the user 10 seconds to read this status. */
-    attempts = 10;
-    while (attempts--) {
-        KeWaitForSingleObject(
-            &dummy_event,
-            Executive,
-            KernelMode,
-            FALSE,
-            &timeout
-          );
-        KeResetEvent(&dummy_event);
       }
     return;
   }
 
-NTSTATUS DriverEntry(
-    IN PDRIVER_OBJECT DriverObject,
-    IN PUNICODE_STRING RegistryPath
+/* Attempt to find the disk with the boot volume */
+static NTSTATUS WbtFindBootDisk(
+    IN PDRIVER_OBJECT drv_obj,
+    IN PVOID context,
+    IN ULONG attempts
   ) {
-    WbtMessage("WaitBt: Alive\n");
-    WbtWaitForBootDisk();
+    static BOOTDISK_INFORMATION info = {0, 0, CvWbtDummySig, CvWbtDummySig};
+    static A_WBT_MSG sig_msg = {0};
+    static U_WBT_LARGE_INT delay_time = {M_WBT_DELAY_TIME};
+    NTSTATUS status;
+    INT sig_msg_size;
+
+    /* Fetch the boot disk information. */
+    status = IoGetBootDiskInformation(&info, sizeof info);
+    if (!NT_SUCCESS(status)) {
+        WbtMessage("WaitBt: Couldn't read boot disk information!\n");
+        goto retry;
+      }
+    /* Check that it's been properly filled */
+    if (
+        info.BootDeviceSignature == CvWbtDummySig ||
+        info.SystemDeviceSignature == CvWbtDummySig
+      ) {
+        WbtMessage("WaitBt: Disk signature(s) not provided!\n");
+        goto retry;
+      }
+    /* Display the signature information to the user */
+    sig_msg_size = sprintf(
+        sig_msg,
+        "WaitBt: Boot sig: 0x%08X Sys sig: 0x%08X\n",
+        info.BootDeviceSignature,
+        info.SystemDeviceSignature
+      );
+    if (sig_msg_size < 1) {
+        WbtMessage("WaitBt: Cannot display disk signatures!\n");
+        goto retry;
+      }
+    DbgPrint(sig_msg);
+    WbtPrint(sig_msg, (USHORT)sig_msg_size);
+    WbtDeregisterIntfNotifications();
+    return STATUS_SUCCESS;
+
+    retry:
+    /* Check if we've reached the maximum number of allowed attempts */
+    if (attempts == CvWbtMaxAttempts) {
+        WbtFailure();
+        return STATUS_UNSUCCESSFUL;
+      }
+    /* Delay and re-schedule a boot disk search */
+    WbtMessage("WaitBt: Waiting...\n");
+    KeDelayExecutionThread(KernelMode, FALSE, &delay_time.large_int);
+    IoRegisterBootDriverReinitialization(drv_obj, WbtFindBootDisk, NULL);
     return STATUS_SUCCESS;
   }
 
+static NTSTATUS WbtInterfaceArrived(
+    IN PVOID notification,
+    IN PVOID context
+  ) {
+    INT msg_size;
+    A_WBT_MSG msg;
+    ANSI_STRING msg_str = {sizeof msg, sizeof msg, msg};
+    UNICODE_STRING msg_ustr = {sizeof msg, sizeof msg, 0};
+    PDEVICE_INTERFACE_CHANGE_NOTIFICATION notice;
+    NTSTATUS status;
 
+    notice = notification;
+    msg_size = sprintf(msg, "WaitBt: %s arrived: ", context);
+    if (msg_size < 1) {
+        WbtMessage("WaitBt: Message problem!\n");
+        return STATUS_UNSUCCESSFUL;
+      } else {
+        DbgPrint(msg);
+        WbtPrint(msg, (USHORT)msg_size);
+      }
+    msg_ustr.Buffer = notice->SymbolicLinkName->Buffer;
+    msg_ustr.Length = notice->SymbolicLinkName->Length < sizeof msg ?
+      notice->SymbolicLinkName->Length :
+      sizeof msg;
+
+    status = RtlUnicodeStringToAnsiString(
+        &msg_str,
+        &msg_ustr,
+        FALSE
+      );
+    if (!NT_SUCCESS(status)) {
+        WbtMessage("WaitBt: Message problem!\n");
+        return STATUS_UNSUCCESSFUL;
+      } else {
+        DbgPrint(msg);
+        WbtPrint(msg, notice->SymbolicLinkName->Length);
+      }
+    WbtMessage("\n");
+
+    return STATUS_SUCCESS;
+  }
+
+/* Register for notification of certain device interface arrivals */
+static VOID WbtRegisterIntfNotifications(PDRIVER_OBJECT drv_obj) {
+    SIZE_T i;
+    NTSTATUS status;
+
+    FOR_EACH_ELEMENT(i, WbtIntfs) {
+        WbtIntfs[i].guid = *WbtIntfs[i].from_guid;
+        status = IoRegisterPlugPlayNotification(
+            EventCategoryDeviceInterfaceChange,
+            PNPNOTIFY_DEVICE_INTERFACE_INCLUDE_EXISTING_INTERFACES,
+            &WbtIntfs[i].guid,
+            drv_obj,
+            WbtInterfaceArrived,
+            WbtIntfs[i].intf_name,
+            &WbtIntfs[i].registration
+          );
+        if (!NT_SUCCESS(status)) {
+            INT msg_size;
+            A_WBT_MSG msg;
+
+            msg_size = sprintf(
+                msg,
+                "WaitBt: %s notifications failed!\n",
+                WbtIntfs[i].intf_name
+              );
+            if (msg_size < 1) {
+                WbtMessage("WaitBt: Message problem!\n");
+              } else {
+                DbgPrint(msg);
+                WbtPrint(msg, (USHORT)msg_size);
+              }
+          }
+      }
+    return;
+  }
+
+/* The driver entry-point */
+NTSTATUS DriverEntry(
+    IN PDRIVER_OBJECT DriverObj,
+    IN PUNICODE_STRING RegPath
+  ) {
+    WbtMessage("WaitBt: Alive\n");
+
+    WbtRegisterIntfNotifications(DriverObj);
+
+    /* Schedule a boot disk search */
+    IoRegisterBootDriverReinitialization(DriverObj, WbtFindBootDisk, NULL);
+    return STATUS_SUCCESS;
+  }
